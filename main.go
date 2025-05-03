@@ -1,15 +1,22 @@
 package main
 
 import (
+	"context"
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 )
+
+var wg sync.WaitGroup
+var shutdownCtx, shutdownCancel = context.WithCancel(context.Background())
 
 func main() {
 	log.SetFormatter(&log.TextFormatter{
@@ -33,7 +40,23 @@ func main() {
 	}
 	log.Warn("Starting the converterd service...")
 
+	// Handle signals for graceful shutdown
+	go handleSignals()
+
 	watchFolders()
+
+	// Wait for all ongoing tasks to complete
+	wg.Wait()
+	log.Warn("Shutting down gracefully...")
+}
+
+func handleSignals() {
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+
+	<-signalChan
+	log.Warn("Received shutdown signal, waiting for tasks to complete...")
+	shutdownCancel() // Cancel the context to signal shutdown
 }
 
 func watchFolders() {
@@ -51,7 +74,7 @@ func watchFolders() {
 	folders := strings.Split(folders_str, ",")
 	log.Infof("Watching the following folders: %v", folders)
 
-	// Poll the folders every 60 seconds
+	// Poll the folders every CHECK_SECONDS
 	ticker := time.NewTicker(check_frequency)
 	defer ticker.Stop()
 
@@ -59,17 +82,24 @@ func watchFolders() {
 		select {
 		case <-ticker.C:
 			log.Debug("Checking for new files...")
-			// Check for new files in the folders
 			for _, folder := range folders {
-				log.Debugf("Checking folder: %s", folder)
-				checkForNewFiles(folder)
+				select {
+				case <-shutdownCtx.Done():
+					log.Warn("Shutdown in progress, stopping folder checks...")
+					return
+				default:
+					log.Debugf("Checking folder: %s", folder)
+					checkForNewFiles(folder)
+				}
 			}
+		case <-shutdownCtx.Done():
+			log.Warn("Shutdown in progress, stopping ticker...")
+			return
 		}
 	}
 }
 
 func checkForNewFiles(folder string) {
-	// Iterate through every file in this folder
 	files, err := ioutil.ReadDir(folder)
 	if err != nil {
 		log.Errorf("Error reading folder %s: %v", folder, err)
@@ -78,23 +108,24 @@ func checkForNewFiles(folder string) {
 	for _, file := range files {
 		filePath := folder + "/" + file.Name()
 		if file.IsDir() {
-			// Walk subdir
 			log.Debugf("Found directory: %s", filePath)
 			checkForNewFiles(filePath)
 			continue
 		}
 		log.Debugf("Found file: %s", filePath)
 		if isNewFile(filePath) {
-			processFile(folder, file)
+			wg.Add(1) // Increment the wait group counter
+			go func(folder string, file os.FileInfo) {
+				defer wg.Done() // Decrement the counter when done
+				processFile(folder, file)
+			}(folder, file)
 		}
 	}
 }
 
 func isNewFile(filePath string) bool {
-	// If the file is ".flac"
 	if strings.HasSuffix(filePath, ".flac") {
 		log.Debugf("File is a .flac file: %s", filePath)
-		// If the same file name does not exist with ".mp3"
 		mp3FileName := strings.TrimSuffix(filePath, ".flac") + ".mp3"
 		log.Debugf("Checking for .mp3 file: %s", mp3FileName)
 		if _, err := os.Stat(mp3FileName); os.IsNotExist(err) {
@@ -109,7 +140,7 @@ func isNewFile(filePath string) bool {
 func processFile(folder string, file os.FileInfo) {
 	inputFile := folder + "/" + file.Name()
 	outputFile := folder + "/" + strings.TrimSuffix(file.Name(), ".flac") + ".mp3"
-	cmd := exec.Command("ffmpeg", "-i", inputFile, "-codec:a", "libmp3lame", "-b:a", "192k", outputFile)
+	cmd := exec.CommandContext(shutdownCtx, "ffmpeg", "-i", inputFile, "-codec:a", "libmp3lame", "-b:a", "192k", outputFile)
 	log.Infof("Running command: %s", strings.Join(cmd.Args, " "))
 	err := cmd.Run()
 	if err != nil {
