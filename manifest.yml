@@ -1,0 +1,34 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: converterd
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: converterd
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: converterd
+    spec:
+      containers:
+      - env:
+        - name: WATCH_FOLDERS
+          value: /mnt/nfs/PATH_TO_YOUR_MEDIA_LIBRARY
+        - name: CHECK_SECONDS
+          value: "300" # Set to 1 for testing
+        - name: LOG_LEVEL
+          value: "debug" # Set to "info" for production
+        image: ghcr.io/alex4108/converterd:latest
+        imagePullPolicy: Always
+        name: converterd
+        volumeMounts:
+        - mountPath: /mnt/nfs/
+          name: media-library
+      volumes:
+      - name: media-library
+        persistentVolumeClaim:
+          claimName: YOUR_PVC_NAME
